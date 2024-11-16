@@ -1,0 +1,226 @@
+# Install required libraries
+!pip install numpy pandas matplotlib gym
+
+import numpy as np
+import pandas as pd
+import random
+import matplotlib.pyplot as plt
+from gym import Env
+from gym.spaces import Discrete, Box
+
+# Synthetic Data Generation
+def generate_synthetic_data(num_orders, num_riders):
+    """Generate synthetic data for orders and riders."""
+    np.random.seed(42)
+
+    orders = pd.DataFrame({
+        'OrderID': range(1, num_orders + 1),
+        'PickupLat': np.random.uniform(26.50, 27.17, num_orders).astype(float),
+        'PickupLon': np.random.uniform(80.50, 81.22, num_orders).astype(float),
+        'DropLat': np.random.uniform(26.50, 27.17, num_orders).astype(float),
+        'DropLon': np.random.uniform(80.50, 81.22, num_orders).astype(float),
+        'OrderWeight': np.random.uniform(0.5, 2.0, num_orders).astype(float),  # in kg
+        'PrepTime': np.random.randint(10, 30, num_orders).astype(int),  # in minutes
+        'PackagingTime': np.random.randint(5, 15, num_orders).astype(int),  # in minutes
+    })
+
+    riders = pd.DataFrame({
+        'RiderID': range(1, num_riders + 1),
+        'Capacity': np.full(num_riders, 20, dtype=float),  # Max capacity in kg
+        'LocationLat': np.random.uniform(26.50, 27.17, num_riders).astype(float),
+        'LocationLon': np.random.uniform(80.50, 81.22, num_riders).astype(float),
+        'IdleTime': np.zeros(num_riders, dtype=float),
+    })
+
+    return orders, riders
+
+
+# Environment for Reinforcement Learning
+class LogisticsEnv(Env):
+    def _init_(self, orders, riders):
+        super(LogisticsEnv, self)._init_()
+        self.orders = orders
+        self.riders = riders
+        self.num_orders = len(orders)
+        self.num_riders = len(riders)
+        
+        # Action space: Assign order to a rider
+        self.action_space = Discrete(self.num_orders * self.num_riders)
+        
+        # Observation space: Encodes rider and order states
+        self.observation_space = Box(low=0, high=100, shape=(self.num_orders + self.num_riders,), dtype=np.float32)
+        
+        # Initial state
+        self.state = self._get_initial_state()
+
+    def _get_initial_state(self):
+        """Initial state combining order and rider data."""
+        state = np.concatenate([
+            self.orders[['OrderWeight', 'PrepTime', 'PackagingTime']].values.flatten(),
+            self.riders[['IdleTime']].values.flatten(),
+        ])
+        return (state - state.min()) / (state.max() - state.min())  # Normalize state
+
+    def step(self, action):
+        """Execute the action and return the new state, reward, and done."""
+        order_idx = action // self.num_riders
+        rider_idx = action % self.num_riders
+
+        # Validate indices
+        if order_idx >= len(self.orders) or rider_idx >= len(self.riders):
+            reward = -100  # Penalize invalid action
+            done = True
+            self.state = self._get_initial_state()
+            return self.state, reward, done, {}
+
+        # Fetch selected order and rider
+        selected_order = self.orders.iloc[order_idx]
+        selected_rider = self.riders.iloc[rider_idx]
+
+        # Calculate travel distance
+        pickup_distance = np.sqrt(
+            (selected_rider['LocationLat'] - selected_order['PickupLat'])**2 +
+            (selected_rider['LocationLon'] - selected_order['PickupLon'])**2
+        )
+        drop_distance = np.sqrt(
+            (selected_order['PickupLat'] - selected_order['DropLat'])**2 +
+            (selected_order['PickupLon'] - selected_order['DropLon'])**2
+        )
+        total_distance = pickup_distance + drop_distance
+
+        # Check capacity and calculate reward
+        if selected_rider['Capacity'] < selected_order['OrderWeight']:
+            reward = -10  # Penalty for exceeding capacity
+        else:
+            reward = -1 * (total_distance + selected_rider['IdleTime'])  # Minimize distance and idle time
+            self.riders.loc[rider_idx, 'Capacity'] -= float(selected_order['OrderWeight'])  # Explicitly cast
+            self.riders.loc[rider_idx, 'IdleTime'] += float(total_distance)  # Explicitly cast
+
+        # Mark order as completed
+        self.orders = self.orders.drop(order_idx).reset_index(drop=True)
+        done = len(self.orders) == 0
+
+        # Update state
+        self.state = self._get_initial_state()
+        return self.state, reward, done, {}
+
+    def reset(self):
+        """Reset environment to initial state."""
+        self.orders, self.riders = generate_synthetic_data(self.num_orders, self.num_riders)
+        self.state = self._get_initial_state()
+        return self.state
+
+
+# Q-Learning Agent
+class QLearningAgent:
+    def _init_(self, env, alpha=0.1, gamma=0.9, epsilon=0.1):
+        self.env = env
+        self.alpha = alpha  # Learning rate
+        self.gamma = gamma  # Discount factor
+        self.epsilon = epsilon  # Exploration rate
+        self.q_table = {}
+
+    def get_state_index(self, state):
+        """Convert continuous state to a hashable index."""
+        return tuple(state.round(2))  # Round to 2 decimals for stability
+
+    def train(self, episodes=100):
+        for episode in range(episodes):
+            state = self.env.reset()
+            state_idx = self.get_state_index(state)
+            done = False
+            total_reward = 0
+
+            while not done:
+                if random.uniform(0, 1) < self.epsilon:
+                    action = self.env.action_space.sample()
+                else:
+                    if state_idx not in self.q_table:
+                        self.q_table[state_idx] = np.zeros(self.env.action_space.n)
+                    action = np.argmax(self.q_table[state_idx])
+
+                next_state, reward, done, _ = self.env.step(action)
+                next_state_idx = self.get_state_index(next_state)
+
+                if next_state_idx not in self.q_table:
+                    self.q_table[next_state_idx] = np.zeros(self.env.action_space.n)
+
+                # Q-Learning update
+                best_next_action = np.argmax(self.q_table[next_state_idx])
+                self.q_table[state_idx][action] = self.q_table[state_idx][action] + self.alpha * (
+                    reward + self.gamma * self.q_table[next_state_idx][best_next_action] - self.q_table[state_idx][action]
+                )
+
+                state_idx = next_state_idx
+                total_reward += reward
+
+            print(f"Episode {episode + 1}: Total Reward = {total_reward}")
+
+    def test(self, episodes=10):
+        for episode in range(episodes):
+            state = self.env.reset()
+            state_idx = self.get_state_index(state)
+            done = False
+            total_reward = 0
+
+            while not done:
+                if state_idx not in self.q_table:
+                    self.q_table[state_idx] = np.zeros(self.env.action_space.n)
+                action = np.argmax(self.q_table[state_idx])
+
+                next_state, reward, done, _ = self.env.step(action)
+                next_state_idx = self.get_state_index(next_state)
+                state_idx = next_state_idx
+                total_reward += reward
+
+            print(f"Test Episode {episode + 1}: Total Reward = {total_reward}")
+
+
+# Visualization
+def visualize_routes(orders, riders, title="Rider Routes"):
+    """Visualize routes on a 2D map."""
+    plt.figure(figsize=(10, 8))
+    
+    # Plot rider locations
+    plt.scatter(riders['LocationLon'], riders['LocationLat'], color='blue', label='Riders', s=100, alpha=0.7)
+    
+    # Plot order pickups and drop-offs
+    plt.scatter(orders['PickupLon'], orders['PickupLat'], color='green', label='Pickups', s=70, alpha=0.6)
+    plt.scatter(orders['DropLon'], orders['DropLat'], color='red', label='Drop-offs', s=70, alpha=0.6)
+    
+    # Draw routes
+    for _, order in orders.iterrows():
+        plt.plot([order['PickupLon'], order['DropLon']], 
+                 [order['PickupLat'], order['DropLat']], 
+                 color='black', linestyle='--', alpha=0.5)
+    
+    plt.title(title)
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+# Main Execution
+if _name_ == "_main_":
+    # Generate synthetic data
+    orders, riders = generate_synthetic_data(50, 10)
+
+    # Visualize initial routes
+    visualize_routes(orders, riders, title="Initial Rider Routes")
+
+    # Create environment and train agent
+    env = LogisticsEnv(orders, riders)
+    agent = QLearningAgent(env)
+
+    # Train the agent
+    print("Training Q-Learning Agent...")
+    agent.train(episodes=100)
+
+    # Test the agent
+    print("Testing Q-Learning Agent...")
+    agent.test(episodes=10)
+
+    # Visualize final routes
+    visualize_routes(orders, riders, title="Final Rider Routes")
